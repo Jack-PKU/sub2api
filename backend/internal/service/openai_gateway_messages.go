@@ -527,7 +527,7 @@ func (s *OpenAIGatewayService) handleAnthropicErrorResponse(
 
 // handleAnthropicBufferedStreamingResponse reads all Responses SSE events from
 // the upstream streaming response, finds the terminal event (response.completed
-// / response.incomplete / response.failed), converts the complete response to
+// / response.incomplete / response.failed / response.cancelled), converts the complete response to
 // Anthropic Messages JSON format, and writes it to the client.
 // This is used when the client requested stream=false but the upstream is always
 // streaming.
@@ -595,6 +595,12 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 		writeAnthropicError(c, http.StatusBadGateway, "api_error", message)
 		return nil, fmt.Errorf("upstream response failed: %s", message)
 	}
+	if isOpenAICompatCancelledStatus(finalResponse.Status) {
+		message := "Upstream response was cancelled"
+		s.recordOpenAIMessagesStreamUpstreamError(c, account, requestID, "stream_cancelled", message)
+		writeAnthropicError(c, http.StatusBadGateway, "api_error", message)
+		return nil, fmt.Errorf("upstream response cancelled")
+	}
 
 	// When the terminal event has an empty output array, reconstruct from
 	// accumulated delta events so the client receives the full content.
@@ -633,11 +639,16 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 
 func isOpenAICompatResponsesTerminalEvent(eventType string) bool {
 	switch strings.TrimSpace(eventType) {
-	case "response.completed", "response.done", "response.incomplete", "response.failed":
+	case "response.completed", "response.done", "response.incomplete", "response.failed", "response.cancelled", "response.canceled":
 		return true
 	default:
 		return false
 	}
+}
+
+func isOpenAICompatCancelledStatus(status string) bool {
+	status = strings.TrimSpace(status)
+	return status == "cancelled" || status == "canceled"
 }
 
 func (s *OpenAIGatewayService) recordOpenAIMessagesStreamUpstreamError(c *gin.Context, account *Account, upstreamRequestID, kind, message string) {
@@ -989,6 +1000,24 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 					}
 				}
 				streamNonFailoverErr = fmt.Errorf("upstream response failed: %s", errMsg)
+				return true
+			}
+			if eventType == "response.cancelled" || eventType == "response.canceled" ||
+				(event.Response != nil && isOpenAICompatCancelledStatus(event.Response.Status)) {
+				message := "Upstream response was cancelled"
+				s.recordOpenAIMessagesStreamUpstreamError(c, account, requestID, "stream_cancelled", message)
+				if !clientDisconnected {
+					if !clientOutputStarted {
+						writeAnthropicError(c, http.StatusBadGateway, "api_error", message)
+						clientOutputStarted = true
+					} else {
+						writeStreamHeaders()
+						if _, err := fmt.Fprint(c.Writer, buildAnthropicStreamErrorSSE("api_error", message)); err == nil {
+							c.Writer.Flush()
+						}
+					}
+				}
+				streamNonFailoverErr = fmt.Errorf("upstream response cancelled")
 				return true
 			}
 		}
