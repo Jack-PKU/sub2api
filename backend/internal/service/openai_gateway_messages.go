@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -1264,9 +1266,76 @@ func writeAnthropicError(c *gin.Context, statusCode int, errType, message string
 		"type": "error",
 		"error": gin.H{
 			"type":    errType,
-			"message": message,
+			"message": normalizeAnthropicContextWindowMessage(statusCode, errType, message),
 		},
 	})
+}
+
+// anthropicContextWindowMarker is the phrase an Anthropic Messages client looks
+// for to recognise a context overflow and react by compacting its history
+// instead of surfacing a dead end. It must appear verbatim and, when token
+// counts are known, be followed by "<used> tokens > <limit>" with no other
+// digits in between so the client's own parser can recover both numbers.
+const anthropicContextWindowMarker = "prompt is too long"
+
+// openAIContextWindowTokenCounts extracts (used, limit) from the OpenAI phrasing
+// "This model's maximum context length is <limit> tokens. However, your messages
+// resulted in <used> tokens." Both numbers must be present and consistent
+// (used > limit > 0); anything else yields ok=false so the caller degrades to a
+// count-free message rather than inventing numbers.
+var openAIContextWindowLimitRe = regexp.MustCompile(`(?i)max(?:imum)? context length is\s+(\d+)\s+tokens`)
+var openAIContextWindowUsedRe = regexp.MustCompile(`(?i)resulted in\s+(\d+)\s+tokens`)
+
+func openAIContextWindowTokenCounts(message string) (used int, limit int, ok bool) {
+	limitMatch := openAIContextWindowLimitRe.FindStringSubmatch(message)
+	usedMatch := openAIContextWindowUsedRe.FindStringSubmatch(message)
+	if len(limitMatch) < 2 || len(usedMatch) < 2 {
+		return 0, 0, false
+	}
+	limit, errLimit := strconv.Atoi(limitMatch[1])
+	used, errUsed := strconv.Atoi(usedMatch[1])
+	if errLimit != nil || errUsed != nil || limit <= 0 || used <= limit {
+		return 0, 0, false
+	}
+	return used, limit, true
+}
+
+// normalizeAnthropicContextWindowMessage rewrites an upstream context-overflow
+// rejection into the wording an Anthropic Messages client understands.
+//
+// The upstream speaks OpenAI ("Your input exceeds the context window",
+// "context_length_exceeded"), which an Anthropic client does not recognise, so a
+// recoverable overflow surfaced as a hard invalid_request_error and the client
+// stopped instead of compacting and retrying. Only invalid-request-shaped
+// rejections that the shared classifier already identifies as context overflow
+// are rewritten; every other error keeps its upstream text untouched. The
+// original message is preserved in parentheses so operators lose no diagnostic
+// detail.
+func normalizeAnthropicContextWindowMessage(statusCode int, errType, message string) string {
+	trimmed := strings.TrimSpace(message)
+	if trimmed == "" {
+		return message
+	}
+	if statusCode != http.StatusBadRequest && statusCode != http.StatusRequestEntityTooLarge {
+		return message
+	}
+	if errType != "invalid_request_error" {
+		return message
+	}
+	if !isOpenAIContextWindowError(trimmed, nil) {
+		return message
+	}
+	if strings.Contains(strings.ToLower(trimmed), anthropicContextWindowMarker) {
+		// Already in the expected wording (or relayed from an Anthropic upstream).
+		return message
+	}
+
+	if used, limit, ok := openAIContextWindowTokenCounts(trimmed); ok {
+		return fmt.Sprintf("%s: %d tokens > %d maximum (upstream: %s)",
+			anthropicContextWindowMarker, used, limit, trimmed)
+	}
+	return fmt.Sprintf("%s for the upstream context window (upstream: %s)",
+		anthropicContextWindowMarker, trimmed)
 }
 
 // buildAnthropicStreamErrorSSE builds one Anthropic SSE `error` event so a

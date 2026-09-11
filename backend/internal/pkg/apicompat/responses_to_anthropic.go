@@ -7,6 +7,14 @@ import (
 	"time"
 )
 
+// reasoningSummaryPartSeparator joins consecutive reasoning summary parts.
+// Responses marks a paragraph boundary structurally (a new summary part with an
+// incremented summary_index) while an Anthropic thinking block is one flat
+// string, so the boundary has to be re-encoded as text or the parts run
+// together. A blank line matches how the parts render upstream and keeps the
+// streaming and non-streaming converters byte-identical.
+const reasoningSummaryPartSeparator = "\n\n"
+
 // ---------------------------------------------------------------------------
 // Non-streaming: ResponsesResponse → AnthropicResponse
 // ---------------------------------------------------------------------------
@@ -27,12 +35,17 @@ func ResponsesToAnthropic(resp *ResponsesResponse, model string) *AnthropicRespo
 	for _, item := range resp.Output {
 		switch item.Type {
 		case "reasoning":
-			summaryText := ""
+			// Upstream splits one reasoning item into several summary parts.
+			// Concatenating them bare runs the parts together ("**A****B**"),
+			// so join with a blank line: each part is an independent paragraph
+			// and Anthropic thinking blocks carry no part structure of their own.
+			summaryParts := make([]string, 0, len(item.Summary))
 			for _, s := range item.Summary {
 				if s.Type == "summary_text" && s.Text != "" {
-					summaryText += s.Text
+					summaryParts = append(summaryParts, s.Text)
 				}
 			}
+			summaryText := strings.Join(summaryParts, reasoningSummaryPartSeparator)
 			// Always surface encrypted_content as thinking.signature so Claude
 			// Code / multi-turn clients can send it back. Signature-only
 			// thinking blocks are valid when the model omits a visible summary.
@@ -245,6 +258,11 @@ func ResponsesEventToAnthropicEvents(
 		return resToAnthHandleFuncArgsDone(evt, state)
 	case "response.output_item.done":
 		return resToAnthHandleOutputItemDone(evt, state)
+	case "response.reasoning_summary_part.added":
+		// 一个 reasoning item 会被上游切成多个 summary part。part 之间只有
+		// summary_index 递增，没有任何文本分隔；直接拼接会让相邻 part 粘成
+		// "**A****B**"。在第二个及之后的 part 开始处补一个空行，还原段落边界。
+		return resToAnthHandleReasoningSummaryPartAdded(evt, state)
 	case "response.reasoning_summary_text.delta",
 		// 原始推理文本增量，与 reasoning summary 一样映射为 thinking。
 		"response.reasoning_text.delta":
@@ -537,6 +555,32 @@ func resToAnthHandleFuncArgsDone(evt *ResponsesStreamEvent, state *ResponsesEven
 	}}
 	events = append(events, closeCurrentBlock(state)...)
 	return events
+}
+
+// resToAnthHandleReasoningSummaryPartAdded restores the paragraph boundary that
+// the Responses protocol expresses structurally (a new summary part) but the
+// Anthropic thinking block cannot: it emits a blank-line thinking_delta before
+// every part after the first. summary_index 0 opens the block and must not be
+// prefixed. A part arriving for an output index with no open thinking block is
+// ignored, matching resToAnthHandleReasoningDelta.
+func resToAnthHandleReasoningSummaryPartAdded(evt *ResponsesStreamEvent, state *ResponsesEventToAnthropicState) []AnthropicStreamEvent {
+	if evt.SummaryIndex <= 0 {
+		return nil
+	}
+
+	blockIdx, ok := state.OutputIndexToBlockIdx[evt.OutputIndex]
+	if !ok {
+		return nil
+	}
+
+	return []AnthropicStreamEvent{{
+		Type:  "content_block_delta",
+		Index: &blockIdx,
+		Delta: &AnthropicDelta{
+			Type:     "thinking_delta",
+			Thinking: reasoningSummaryPartSeparator,
+		},
+	}}
 }
 
 func resToAnthHandleReasoningDelta(evt *ResponsesStreamEvent, state *ResponsesEventToAnthropicState) []AnthropicStreamEvent {

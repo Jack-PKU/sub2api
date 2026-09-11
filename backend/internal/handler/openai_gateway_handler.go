@@ -1002,6 +1002,7 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
 	promptCacheKey := h.gatewayService.ExtractSessionID(c, body)
 	sessionHash, promptCacheKey = resolveOpenAIMessagesMetadataSession(sessionHash, promptCacheKey, reqModel, body)
+	sessionHash = resolveOpenAIMessagesClientStickySession(c, sessionHash, routingModel, reqLog)
 	if h.rejectIfCyberSessionBlocked(c, apiKey, body, reqModel, cyberBlockFormatAnthropic) {
 		return
 	}
@@ -1263,6 +1264,48 @@ func (h *OpenAIGatewayHandler) Messages(c *gin.Context) {
 		)
 		return
 	}
+}
+
+// resolveOpenAIMessagesClientStickySession prefers the caller's explicit session
+// identifier over the body-derived content seed when choosing the sticky-session
+// key for an Anthropic Messages request.
+//
+// GenerateSessionHash seeds from model + tools + the first user message. That is
+// a reasonable identity for a stateless OpenAI-compatible caller, but a coding
+// harness like Claude Code mutates the body on every turn (system-reminder
+// blocks, cache_control markers, growing tool history), so the seed changed each
+// turn, a brand-new sticky key was written per request, the pin never held, and
+// account selection fell through to priority+LRU. Observed effect: one
+// conversation alternated between two upstream accounts in a 2,2,1,1 pattern and
+// lost the upstream prompt cache on every switch, re-sending tens of thousands
+// of already-cached prefix tokens.
+//
+// The client session id is stable for the whole conversation, which is exactly
+// the identity sticky routing wants. Callers that send no session header keep
+// the previous content-seed behaviour untouched. This only affects account
+// stickiness; the upstream prompt-cache key stays with ForwardAsAnthropic so
+// cache rolling across turns is unchanged.
+func resolveOpenAIMessagesClientStickySession(c *gin.Context, contentSessionHash, routingModel string, reqLog *zap.Logger) string {
+	clientSessionID := service.ExtractClientSessionID(c)
+	if clientSessionID == "" {
+		return contentSessionHash
+	}
+
+	// Collapse client-side selector suffixes so a client toggling between
+	// "claude-opus-5" and "claude-opus-5[1m]" mid-conversation keeps one pin:
+	// both reach the same upstream model, so they must not split the cache.
+	stickyModel := service.NormalizeStickySessionModel(routingModel)
+	sessionHash := service.DeriveSessionHashFromSeed(stickyModel + "-" + clientSessionID)
+	if sessionHash == "" {
+		return contentSessionHash
+	}
+	if reqLog != nil {
+		reqLog.Debug("openai_messages.sticky_seed_from_client_session",
+			zap.String("sticky_model", stickyModel),
+			zap.Bool("replaced_content_seed", contentSessionHash != "" && contentSessionHash != sessionHash),
+		)
+	}
+	return sessionHash
 }
 
 func resolveOpenAIMessagesMetadataSession(sessionHash, promptCacheKey, reqModel string, body []byte) (string, string) {

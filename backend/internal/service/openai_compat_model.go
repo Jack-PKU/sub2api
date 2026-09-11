@@ -19,6 +19,19 @@ func NormalizeOpenAICompatRequestedModel(model string) string {
 	return normalized
 }
 
+// NormalizeStickySessionModel collapses every client-side selector suffix that
+// does not change which upstream model is reached: the reasoning-effort suffix
+// and Claude Code's "[1m]" long-context selector. Sticky account bindings are
+// keyed on the result so a client toggling a selector mid-conversation keeps one
+// pin instead of splitting its upstream prompt cache across two accounts.
+//
+// It is deliberately separate from NormalizeOpenAICompatRequestedModel, which
+// feeds model routing and must keep the long-context selector visible to the
+// mapping layer.
+func NormalizeStickySessionModel(model string) string {
+	return NormalizeOpenAICompatRequestedModel(normalizeClaudeCodeLongContextModel(strings.TrimSpace(model)))
+}
+
 func applyOpenAICompatModelNormalization(req *apicompat.AnthropicRequest) {
 	if req == nil {
 		return

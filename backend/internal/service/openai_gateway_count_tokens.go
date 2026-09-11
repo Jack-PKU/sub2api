@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
@@ -21,6 +22,18 @@ const (
 	openAIResponsesInputItemTokenOverhead = 3
 	openAIResponsesContentPartOverhead    = 1
 	openAIInputTokensFallbackMinimum      = 1
+
+	// openAIInputTokensUnsupportedTTL bounds how long a per-account "platform
+	// input_tokens is unusable" verdict suppresses the upstream probe. Long
+	// enough that a Claude Code session (and its end-of-turn burst of 80+
+	// count_tokens calls) costs one probe at most, short enough that a
+	// re-authorized credential recovers on its own.
+	openAIInputTokensUnsupportedTTL = 6 * time.Hour
+
+	// openAIInputTokensMemoizedStatus marks a fallback that skipped the upstream
+	// probe entirely. It is not an HTTP status: 0 distinguishes these log lines
+	// from a fallback triggered by a real upstream 401/403/404.
+	openAIInputTokensMemoizedStatus = 0
 )
 
 type openAIInputTokensCountRequest struct {
@@ -106,6 +119,19 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 		zap.String("upstream_model", prepared.UpstreamModel),
 	)
 
+	// A ChatGPT subscription OAuth credential carries no api.responses.write
+	// scope, so the platform input_tokens endpoint answers 401 for every single
+	// call. Claude Code issues count_tokens in bursts (80+ within a second at
+	// the end of a turn), so re-probing per call spent one doomed upstream
+	// round trip each time. Once an account has answered "unsupported", serve
+	// the local estimate directly until the verdict expires; the probe resumes
+	// afterwards so a credential that later gains the scope is picked up
+	// instead of being permanently downgraded.
+	if s.openAIInputTokensProbeSuppressed(account) {
+		writeOpenAIOAuthInputTokensFallback(c, account, prepared, openAIInputTokensMemoizedStatus)
+		return nil
+	}
+
 	token, _, err := s.GetAccessToken(ctx, account)
 	if err != nil {
 		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to get access token")
@@ -140,6 +166,7 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 	if resp.StatusCode >= 400 {
 		upstreamMsg := sanitizeUpstreamErrorMessage(strings.TrimSpace(extractUpstreamErrorMessage(respBody)))
 		if account.Type == AccountTypeOAuth && isOpenAIOAuthInputTokensUnsupported(resp.StatusCode, respBody) {
+			s.rememberOpenAIInputTokensUnsupported(account, resp.StatusCode)
 			writeOpenAIOAuthInputTokensFallback(c, account, prepared, resp.StatusCode)
 			return nil
 		}
@@ -286,6 +313,50 @@ func writeAnthropicCountTokensError(c *gin.Context, status int, errType, message
 			"message": message,
 		},
 	})
+}
+
+// openAIInputTokensProbeSuppressed reports whether this account already proved
+// the platform input_tokens endpoint unusable and the verdict is still fresh.
+// Only OAuth accounts are memoized: API-key accounts do reach the endpoint, and
+// suppressing their probe would silently downgrade an exact upstream count to a
+// local estimate.
+func (s *OpenAIGatewayService) openAIInputTokensProbeSuppressed(account *Account) bool {
+	if account == nil || account.Type != AccountTypeOAuth {
+		return false
+	}
+	raw, ok := s.openaiInputTokensUnsupportedUntil.Load(account.ID)
+	if !ok {
+		return false
+	}
+	until, ok := raw.(time.Time)
+	if !ok {
+		s.openaiInputTokensUnsupportedUntil.Delete(account.ID)
+		return false
+	}
+	if time.Now().After(until) {
+		// Expired: drop it so exactly one caller re-probes upstream.
+		s.openaiInputTokensUnsupportedUntil.Delete(account.ID)
+		return false
+	}
+	return true
+}
+
+// rememberOpenAIInputTokensUnsupported records that this account's credential
+// cannot use the platform input_tokens endpoint. The verdict is deliberately
+// time-bounded rather than permanent so a re-authorized credential recovers
+// without a gateway restart.
+func (s *OpenAIGatewayService) rememberOpenAIInputTokensUnsupported(account *Account, statusCode int) {
+	if account == nil || account.Type != AccountTypeOAuth {
+		return
+	}
+	if _, existed := s.openaiInputTokensUnsupportedUntil.Load(account.ID); !existed {
+		logger.L().Info("openai count_tokens: memoizing input_tokens unsupported for account",
+			zap.Int64("account_id", account.ID),
+			zap.Int("upstream_status", statusCode),
+			zap.Duration("ttl", openAIInputTokensUnsupportedTTL),
+		)
+	}
+	s.openaiInputTokensUnsupportedUntil.Store(account.ID, time.Now().Add(openAIInputTokensUnsupportedTTL))
 }
 
 func isOpenAIInputTokensUnsupported(statusCode int, body []byte) bool {

@@ -146,7 +146,12 @@ func (h *OpenAIGatewayHandler) CountTokens(c *gin.Context) {
 	// count_tokens 不计费：显式豁免利润门，避免高倍率账号池被门排除后连
 	// token 计数都返回 no available accounts。
 	c.Request = c.Request.WithContext(service.WithOpenAIProfitControlSuppressed(c.Request.Context()))
-	sessionHash := h.gatewayService.GenerateSessionHash(c, body)
+	// count_tokens 不参与账号粘性：它既不计费也不消费上游上下文，但客户端会在
+	// 一次回合结束时并发打出几十上百条。让它参与粘性会读写与真实对话同一套
+	// sticky key，把绑定改写成 count_tokens 选中的账号，反过来把后续
+	// /v1/messages 从原账号上挤走、打散上游 prompt 缓存。空 sessionHash 在
+	// selectAccountForModelWithExclusions 中同时跳过粘性命中与粘性写入。
+	sessionHash := ""
 	currentRoutingModel := routingModel
 	if preferredMappedModel != "" {
 		currentRoutingModel = preferredMappedModel

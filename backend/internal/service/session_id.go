@@ -25,9 +25,13 @@ var clientSessionIDHeaders = append(
 // protocol-agnostic and shared by every gateway handler so all supported protocols
 // record session_id through one seam. Returns "" when no valid identifier is present.
 //
-// This value feeds only usage_logs.session_id persistence. It does NOT affect sticky
-// routing, account selection, request_id semantics, or upstream prompt caching, which
-// keep their own (intentionally broader) session-signal resolution.
+// This value feeds usage_logs.session_id persistence on every protocol. It additionally
+// seeds sticky account selection on the Anthropic Messages compat path only (see
+// resolveOpenAIMessagesClientStickySession), because a coding harness rewrites its
+// request body every turn and the body-derived seed therefore never pinned. It still
+// does NOT affect request_id semantics or upstream prompt caching, and it does not
+// affect account selection on any other protocol; those keep their own (intentionally
+// broader) session-signal resolution.
 func ExtractClientSessionID(c *gin.Context) string {
 	if c == nil || c.Request == nil {
 		return ""
