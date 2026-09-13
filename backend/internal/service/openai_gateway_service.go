@@ -462,11 +462,12 @@ type OpenAIGatewayService struct {
 	codexModelsManifestCache            codexModelsManifestCache
 	openaiCompatSessionResponses        sync.Map
 	openaiCompatAnthropicDigestSessions sync.Map
-	// openaiInputTokensUnsupportedUntil memoizes the per-account verdict that the
-	// platform /v1/responses/input_tokens endpoint is unreachable for this
-	// account's credential, so count_tokens stops re-probing it on every call.
-	// key: int64(accountID), value: time.Time (verdict expiry)
-	openaiInputTokensUnsupportedUntil sync.Map
+	// openaiInputTokensProbeState holds the per-account verdict about the platform
+	// /v1/responses/input_tokens endpoint so count_tokens stops re-probing it.
+	// key: int64(accountID), value: openAIInputTokensProbeRunning (a probe is in
+	// flight, nothing known yet), time.Time (unsupported until then), or
+	// openAIInputTokensProbeSupported. Absent means never probed.
+	openaiInputTokensProbeState sync.Map
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

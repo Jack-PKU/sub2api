@@ -127,10 +127,12 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 	// the local estimate directly until the verdict expires; the probe resumes
 	// afterwards so a credential that later gains the scope is picked up
 	// instead of being permanently downgraded.
-	if s.openAIInputTokensProbeSuppressed(account) {
+	serveLocally, releaseProbe := s.claimOpenAIInputTokensProbe(account)
+	if serveLocally {
 		writeOpenAIOAuthInputTokensFallback(c, account, prepared, openAIInputTokensMemoizedStatus)
 		return nil
 	}
+	defer releaseProbe()
 
 	token, _, err := s.GetAccessToken(ctx, account)
 	if err != nil {
@@ -209,6 +211,9 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Upstream response missing input_tokens")
 		return fmt.Errorf("input_tokens response missing input_tokens field")
 	}
+	// The endpoint answered for this credential: stop collapsing later bursts so
+	// every caller keeps getting the exact upstream count.
+	s.rememberOpenAIInputTokensSupported(account)
 
 	c.JSON(http.StatusOK, gin.H{
 		"input_tokens": int(inputTokens.Int()),
@@ -315,30 +320,73 @@ func writeAnthropicCountTokensError(c *gin.Context, status int, errType, message
 	})
 }
 
-// openAIInputTokensProbeSuppressed reports whether this account already proved
-// the platform input_tokens endpoint unusable and the verdict is still fresh.
-// Only OAuth accounts are memoized: API-key accounts do reach the endpoint, and
-// suppressing their probe would silently downgrade an exact upstream count to a
-// local estimate.
-func (s *OpenAIGatewayService) openAIInputTokensProbeSuppressed(account *Account) bool {
+// openAIInputTokensProbeMark is a sentinel stored in the per-account probe state.
+type openAIInputTokensProbeMark int
+
+const (
+	// openAIInputTokensProbeRunning means one caller is probing upstream right now
+	// and no verdict exists yet for this account.
+	openAIInputTokensProbeRunning openAIInputTokensProbeMark = iota
+	// openAIInputTokensProbeSupported means a probe succeeded, so the endpoint is
+	// real for this credential and every caller should keep getting exact counts.
+	openAIInputTokensProbeSupported
+)
+
+// claimOpenAIInputTokensProbe decides whether this request may probe the platform
+// input_tokens endpoint, and returns a release for the caller that claimed it.
+//
+// The account state is one of: absent (never probed), running (a probe is in
+// flight and nothing is known yet), a time.Time (probed unsupported, valid until
+// then), or supported (probe succeeded).
+//
+// The running state exists because a coding client issues count_tokens in bursts
+// of 80+ parallel calls at the start of a turn. A verdict recorded only on
+// completion is still empty when the whole burst reads it, so every call in that
+// burst probed a doomed endpoint - 79 of them in one observed two-second window.
+// Collapsing the burst to a single probe is why concurrent callers answer from
+// the local estimator instead of waiting: count_tokens is an estimate-tolerant
+// convenience endpoint with a local fallback by design, so a wait on a round trip
+// that is about to fail costs latency and buys nothing. An account whose probe
+// actually succeeds is marked supported and never skips again, so a working
+// endpoint keeps returning exact counts after the first burst.
+//
+// Only OAuth accounts take part. API-key accounts reach the endpoint normally and
+// must never be downgraded to a local estimate.
+func (s *OpenAIGatewayService) claimOpenAIInputTokensProbe(account *Account) (serveLocally bool, release func()) {
+	noop := func() {}
 	if account == nil || account.Type != AccountTypeOAuth {
-		return false
+		return false, noop
 	}
-	raw, ok := s.openaiInputTokensUnsupportedUntil.Load(account.ID)
-	if !ok {
-		return false
+	for {
+		actual, loaded := s.openaiInputTokensProbeState.LoadOrStore(account.ID, openAIInputTokensProbeRunning)
+		if !loaded {
+			// We claimed the probe. Clear the marker only if no verdict replaced
+			// it, so a probe that ends without recording one (network error) does
+			// not wedge the account into "running" forever.
+			return false, func() {
+				s.openaiInputTokensProbeState.CompareAndDelete(account.ID, openAIInputTokensProbeRunning)
+			}
+		}
+		switch verdict := actual.(type) {
+		case openAIInputTokensProbeMark:
+			if verdict == openAIInputTokensProbeSupported {
+				return false, noop
+			}
+			return true, noop
+		case time.Time:
+			if time.Now().After(verdict) {
+				// Expired. Drop it and retry the claim so exactly one caller
+				// re-probes; a racing caller either wins the claim or reads the
+				// running marker.
+				s.openaiInputTokensProbeState.CompareAndDelete(account.ID, verdict)
+				continue
+			}
+			return true, noop
+		default:
+			s.openaiInputTokensProbeState.Delete(account.ID)
+			continue
+		}
 	}
-	until, ok := raw.(time.Time)
-	if !ok {
-		s.openaiInputTokensUnsupportedUntil.Delete(account.ID)
-		return false
-	}
-	if time.Now().After(until) {
-		// Expired: drop it so exactly one caller re-probes upstream.
-		s.openaiInputTokensUnsupportedUntil.Delete(account.ID)
-		return false
-	}
-	return true
 }
 
 // rememberOpenAIInputTokensUnsupported records that this account's credential
@@ -349,14 +397,23 @@ func (s *OpenAIGatewayService) rememberOpenAIInputTokensUnsupported(account *Acc
 	if account == nil || account.Type != AccountTypeOAuth {
 		return
 	}
-	if _, existed := s.openaiInputTokensUnsupportedUntil.Load(account.ID); !existed {
+	if previous, existed := s.openaiInputTokensProbeState.Load(account.ID); !existed || previous == any(openAIInputTokensProbeRunning) {
 		logger.L().Info("openai count_tokens: memoizing input_tokens unsupported for account",
 			zap.Int64("account_id", account.ID),
 			zap.Int("upstream_status", statusCode),
 			zap.Duration("ttl", openAIInputTokensUnsupportedTTL),
 		)
 	}
-	s.openaiInputTokensUnsupportedUntil.Store(account.ID, time.Now().Add(openAIInputTokensUnsupportedTTL))
+	s.openaiInputTokensProbeState.Store(account.ID, time.Now().Add(openAIInputTokensUnsupportedTTL))
+}
+
+// rememberOpenAIInputTokensSupported records that the endpoint answered for this
+// credential, so later bursts stop skipping the probe and keep exact counts.
+func (s *OpenAIGatewayService) rememberOpenAIInputTokensSupported(account *Account) {
+	if account == nil || account.Type != AccountTypeOAuth {
+		return
+	}
+	s.openaiInputTokensProbeState.Store(account.ID, openAIInputTokensProbeSupported)
 }
 
 func isOpenAIInputTokensUnsupported(statusCode int, body []byte) bool {
