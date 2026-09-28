@@ -353,6 +353,17 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 	channelMonitorV2Aggregator := service.ProvideChannelMonitorV2Aggregator(channelMonitorV2Repository, db, settingService)
 	userPlatformQuotaUsageFlusher := service.ProvideUserPlatformQuotaUsageFlusher(configConfig, billingCache, serviceUserPlatformQuotaRepository, timingWheelService)
 	v := provideCleanup(client, redisClient, opsMetricsCollector, opsAggregationService, opsAlertEvaluatorService, opsCleanupService, opsScheduledReportService, opsSystemLogSink, opsService, opsIngressRejectAggregator, apiKeyService, authCacheInvalidationWorker, schedulerSnapshotService, tokenRefreshService, accountExpiryService, cnProviderBalanceCheckService, openAICodexVersionSyncService, claudeCodeVersionSyncService, proxyExpiryService, subscriptionExpiryService, usageCleanupService, idempotencyCleanupService, batchImageCleanupService, batchImageWorkerRuntime, pricingService, emailQueueService, billingCacheService, usageRecordWorkerPool, subscriptionService, oAuthService, openAIOAuthService, geminiOAuthService, antigravityOAuthService, grokOAuthService, openAIGatewayService, scheduledTestRunnerService, backupService, paymentOrderExpiryService, channelMonitorRunner, channelMonitorV2Aggregator, userPlatformQuotaUsageFlusher, upstreamBillingProbeService, ollamaCloudUsageService, openCodeGoUsageService, auditLogService, openAIQuotaAutoResetService, promptService, pluginManager)
+	// Warm process-wide Grok model-mapping options from persisted settings at
+	// boot. Without this the runtime options stay at their zero value
+	// (cross-client claude-*/gpt-*→Grok disabled, default text model grok-4.6)
+	// until the first admin settings read lazily triggers parseSettings, so a
+	// freshly restarted gateway would 404 Claude Code (claude-opus-5) requests
+	// routed to a Grok group. GetAllSettings runs parseSettings as a side effect,
+	// which calls xai.SetRuntimeModelMappingOptions. (Manual edit on generated
+	// wire output; re-apply after any wire regeneration.)
+	if _, warmErr := settingService.GetAllSettings(context.Background()); warmErr != nil {
+		log.Printf("Warning: warm settings runtime options at startup failed: %v", warmErr)
+	}
 	application := &Application{
 		Server:        httpServer,
 		PromptAudit:   promptService,
