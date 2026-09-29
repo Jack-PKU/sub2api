@@ -653,6 +653,20 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 			writeAnthropicError(c, status, errType, errMsg)
 			return nil, fmt.Errorf("upstream response failed (passthrough): %s", errMsg)
 		}
+		if isOpenAIContextWindowError(message, payload) {
+			// Relay a context-window overflow with the Anthropic phrasing Claude
+			// Code recognises as a recoverable overflow, so it triggers client-side
+			// compaction instead of surfacing a hard 502 with raw OpenAI wording
+			// (defect-4; the streaming buffered-terminal path, which is what Claude
+			// Code hits since /v1/messages requests stream by default).
+			clientMsg := message
+			if !strings.Contains(strings.ToLower(clientMsg), "prompt is too long") {
+				clientMsg = "prompt is too long: " + message
+			}
+			MarkResponseCommitted(c)
+			writeAnthropicError(c, http.StatusBadRequest, "invalid_request_error", clientMsg)
+			return nil, fmt.Errorf("upstream response failed (context overflow): %s", message)
+		}
 		writeAnthropicError(c, http.StatusBadGateway, "api_error", message)
 		return nil, fmt.Errorf("upstream response failed: %s", message)
 	}

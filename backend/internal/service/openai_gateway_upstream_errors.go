@@ -897,6 +897,7 @@ func (s *OpenAIGatewayService) handleCompatErrorResponse(
 	MarkResponseCommitted(c)
 
 	// Map status code to error type and write response
+	statusCode := resp.StatusCode
 	errType := "api_error"
 	switch {
 	case resp.StatusCode == 400:
@@ -909,6 +910,20 @@ func (s *OpenAIGatewayService) handleCompatErrorResponse(
 		errType = "api_error"
 	}
 
-	writeError(c, resp.StatusCode, errType, upstreamMsg)
+	// Context-window overflow relayed with OpenAI's wording is not recognised by
+	// an Anthropic Messages client (Claude Code) as a recoverable overflow, so it
+	// surfaces as a hard error instead of triggering client-side compaction.
+	// Rewrite it to the Anthropic phrasing the client matches ("prompt is too
+	// long") with invalid_request_error at 400, keeping the upstream detail.
+	// Harmless for the Chat Completions compat writer (still an accurate 400).
+	if isOpenAIContextWindowError(upstreamMsg, body) {
+		statusCode = http.StatusBadRequest
+		errType = "invalid_request_error"
+		if !strings.Contains(strings.ToLower(upstreamMsg), "prompt is too long") {
+			upstreamMsg = "prompt is too long: " + upstreamMsg
+		}
+	}
+
+	writeError(c, statusCode, errType, upstreamMsg)
 	return nil, fmt.Errorf("upstream error: %d %s", resp.StatusCode, upstreamMsg)
 }
