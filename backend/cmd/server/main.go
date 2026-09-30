@@ -182,13 +182,14 @@ func runMainServer() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("Shutting down server...")
+	shutdownTimeout := time.Duration(cfg.Server.ShutdownTimeout) * time.Second
+	log.Printf("Shutting down server, waiting up to %s for in-flight requests...", shutdownTimeout)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
 	if err := app.Server.Shutdown(ctx); err != nil {
-		log.Printf("Server forced to shutdown: %v", err)
+		log.Printf("Server forced to shutdown after %s: %v", shutdownTimeout, err)
 	}
 
 	log.Println("Server exited")

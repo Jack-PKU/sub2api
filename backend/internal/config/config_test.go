@@ -112,6 +112,26 @@ func TestLoadHTTPIngressSafetyDefaults(t *testing.T) {
 	require.Equal(t, 16384, cfg.APIKeyAuth.InvalidAbuse.Capacity)
 }
 
+func TestServerShutdownTimeoutDefaultEnvAndBounds(t *testing.T) {
+	resetViperWithJWTSecret(t)
+	cfg, err := Load()
+	require.NoError(t, err)
+	require.Equal(t, 5, cfg.Server.ShutdownTimeout, "upstream default must stay 5 seconds")
+
+	resetViperWithJWTSecret(t)
+	t.Setenv("SERVER_SHUTDOWN_TIMEOUT", "90")
+	cfg, err = Load()
+	require.NoError(t, err)
+	require.Equal(t, 90, cfg.Server.ShutdownTimeout)
+
+	for _, value := range []string{"0", "3601"} {
+		resetViperWithJWTSecret(t)
+		t.Setenv("SERVER_SHUTDOWN_TIMEOUT", value)
+		_, err = Load()
+		require.ErrorContains(t, err, "server.shutdown_timeout")
+	}
+}
+
 func TestNormalizeForwardedClientIPHeaders(t *testing.T) {
 	headers, err := NormalizeForwardedClientIPHeaders([]string{
 		" x-cdn-client-ip ",
