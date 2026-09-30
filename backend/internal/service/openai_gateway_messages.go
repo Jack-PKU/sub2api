@@ -88,6 +88,8 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		return nil, fmt.Errorf("parse anthropic request: %w", err)
 	}
 	anthropicDigestReq := cloneAnthropicRequestForDigest(&anthropicReq)
+	// Classified before any replay trimming touches the message list.
+	claudeCodeEffortLimit := claudeCodeEffortCeiling(c, &anthropicReq)
 	originalModel := anthropicReq.Model
 	applyOpenAICompatModelNormalization(&anthropicReq)
 	normalizedModel := anthropicReq.Model
@@ -166,6 +168,7 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 	responsesReq.Model = upstreamModel
 	if responsesReq.Reasoning != nil {
 		responsesReq.Reasoning.Effort = openAICompatAnthropicReasoningEffort(&anthropicReq, upstreamModel, responsesReq.Reasoning.Effort)
+		responsesReq.Reasoning.Effort = capReasoningEffort(responsesReq.Reasoning.Effort, claudeCodeEffortLimit)
 	}
 	if previousResponseID != "" {
 		responsesReq.PreviousResponseID = previousResponseID

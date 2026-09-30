@@ -1165,3 +1165,25 @@ func TestResolveGrokCacheIdentityConcurrentDeterminism(t *testing.T) {
 	}
 	require.NotEmpty(t, first)
 }
+
+func TestResolveGrokCacheIdentitySeparatesClaudeCodeSubagents(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	body := []byte(`{"model":"grok","input":[{"role":"user","content":"hi"}]}`)
+	identity := func(agentID string) string {
+		c := newGrokCacheTestContext(302)
+		c.Request.Header.Set(claudeCodeSessionHeader, "cc-session-shared")
+		if agentID != "" {
+			c.Request.Header.Set(claudeCodeAgentIDHeader, agentID)
+		}
+		return resolveGrokCacheIdentity(c, body, "", "grok-4.7-build-fast")
+	}
+
+	main := identity("")
+	first := identity("agent-one")
+	second := identity("agent-two")
+	require.NotEmpty(t, main)
+	require.NotEqual(t, main, first)
+	require.NotEqual(t, first, second)
+	require.Equal(t, first, identity("agent-one"), "an agent keeps one identity across its turns")
+	require.Equal(t, main, identity(""), "the main thread identity is unchanged by subagents")
+}

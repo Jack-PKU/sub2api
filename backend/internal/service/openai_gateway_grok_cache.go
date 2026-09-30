@@ -106,6 +106,12 @@ func explicitGrokCacheSeed(c *gin.Context, body []byte, explicitKey string) stri
 	// /v1/messages → Grok bridges. Prefer it over generic session headers so
 	// prompt cache routing follows the gateway's existing cache affinity rules.
 	seed := extractClaudeCodeSessionID(c, body)
+	// Subagents share their parent's session id but each carries its own
+	// context; one shared identity makes concurrent agents evict each other's
+	// cached prefix, so every agent gets its own.
+	if agentID := claudeCodeAgentID(c); seed != "" && agentID != "" {
+		seed += ":agent:" + agentID
+	}
 	if seed == "" {
 		seed = explicitOpenAIHeaderSessionID(c)
 	}
