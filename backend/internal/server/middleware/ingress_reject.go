@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"math"
 	"net/netip"
 	"strconv"
@@ -50,6 +51,17 @@ func rejectInvalidAuthAbuse(c *gin.Context, apiKeyService interface {
 	retry, blocked := apiKeyService.CheckInvalidAuthAbuse(invalidAuthClientKey(c))
 	if !blocked {
 		return false
+	}
+	// The block is per client IP, and every local seat behind the docker bridge
+	// shares one. A caller presenting a key the auth cache already knows to be
+	// valid is not the one sending wrong keys; let it through instead of
+	// rejecting it with everyone else (cache only, no repository lookup).
+	if cached, ok := apiKeyService.(interface {
+		IsCachedValidAPIKey(context.Context, string) bool
+	}); ok && c.Request != nil {
+		if credential, _ := presentedCredential(c); cached.IsCachedValidAPIKey(c.Request.Context(), credential) {
+			return false
+		}
 	}
 	retrySeconds := int(math.Ceil(retry.Seconds()))
 	if retrySeconds < 1 {

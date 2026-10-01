@@ -222,6 +222,19 @@ func (s *APIKeyService) getAuthCacheEntry(ctx context.Context, cacheKey string) 
 	return entry, true
 }
 
+// IsCachedValidAPIKey reports whether key already has a positive auth-cache
+// entry (L1, or L2 when enabled). It never queries the repository, so an
+// IP-wide invalid-auth block can let a caller with a key that is known to be
+// valid through without reopening database lookups to a brute-force client.
+func (s *APIKeyService) IsCachedValidAPIKey(ctx context.Context, key string) bool {
+	if s == nil || len(key) == 0 || len(key) > MaxAPIKeyCredentialBytes {
+		return false
+	}
+	entry, ok := s.getAuthCacheEntry(ctx, s.authCacheKey(key))
+	return ok && entry != nil && !entry.NotFound && entry.Snapshot != nil &&
+		entry.Snapshot.Version == apiKeyAuthSnapshotVersion
+}
+
 func (s *APIKeyService) setAuthCacheL1(cacheKey string, entry *APIKeyAuthCacheEntry) {
 	if entry == nil {
 		return

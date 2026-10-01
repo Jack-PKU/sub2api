@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -126,6 +127,46 @@ func TestInvalidAuthAbuseDoesNotCountValidOrOperationalFailures(t *testing.T) {
 	r.ServeHTTP(w, req)
 	require.Equal(t, http.StatusOK, w.Code)
 	require.Equal(t, uint64(1), svc.InvalidAuthAbuseHealth().Recorded)
+}
+
+func TestInvalidAuthBlockDoesNotRejectCachedValidKey(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	user := &service.User{ID: 1, Status: service.StatusActive, Role: service.RoleUser, Balance: 1}
+	repoCalls := map[string]int{}
+	repo := &stubApiKeyRepo{getByKey: func(_ context.Context, key string) (*service.APIKey, error) {
+		repoCalls[key]++
+		if key == "valid-key" {
+			return &service.APIKey{ID: 1, UserID: 1, Key: key, Status: service.StatusActive, User: user}, nil
+		}
+		return nil, service.ErrAPIKeyNotFound
+	}}
+	cfg := invalidAuthAbuseTestConfig(2)
+	cfg.APIKeyAuth.L1Size = 64
+	cfg.APIKeyAuth.L1TTLSeconds = 60
+	svc := service.NewAPIKeyService(repo, nil, nil, nil, nil, nil, cfg)
+	r := gin.New()
+	r.Use(gin.HandlerFunc(NewAPIKeyAuthMiddleware(svc, nil, cfg)))
+	r.POST("/t", func(c *gin.Context) { c.Status(http.StatusOK) })
+	serve := func(key string) int {
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httpRequest(t, "/t", "", key))
+		return w.Code
+	}
+
+	require.Equal(t, http.StatusOK, serve("valid-key"))
+	require.Eventually(t, func() bool { return svc.IsCachedValidAPIKey(context.Background(), "valid-key") },
+		time.Second, 10*time.Millisecond, "valid key must reach the auth cache")
+
+	// Same client IP sends wrong keys until it is blocked.
+	require.Equal(t, http.StatusUnauthorized, serve("wrong-1"))
+	require.Equal(t, http.StatusUnauthorized, serve("wrong-2"))
+	require.Equal(t, http.StatusTooManyRequests, serve("wrong-3"))
+
+	before := repoCalls["valid-key"]
+	require.Equal(t, http.StatusOK, serve("valid-key"), "a cached valid key must not be collateral damage")
+	require.Equal(t, before, repoCalls["valid-key"], "the bypass must not query the repository")
+	require.Equal(t, http.StatusTooManyRequests, serve("never-seen-key"))
+	require.Zero(t, repoCalls["never-seen-key"], "unknown keys stay blocked without a lookup")
 }
 
 func TestNormalizeIngressRejectIPGroupsIPv6By64(t *testing.T) {
