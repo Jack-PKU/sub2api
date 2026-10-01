@@ -67,6 +67,9 @@ func Logger() gin.HandlerFunc {
 				zap.String("ingress_reject_reason", string(reason)),
 				zap.Bool(logger.OpsSystemLogSkipField, true),
 			)
+			if reason == IngressRejectInvalidAPIKey || reason == IngressRejectInvalidAuthRateLimited {
+				fields = append(fields, invalidCredentialFields(c)...)
+			}
 		}
 		if hasAccountID && accountID > 0 {
 			fields = append(fields, zap.Int64("account_id", accountID))
